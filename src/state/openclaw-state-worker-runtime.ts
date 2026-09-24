@@ -14,8 +14,13 @@ import {
   executeMcpOAuthWorkerCommand,
 } from "../agents/mcp-oauth-store.worker.js";
 import { importSandboxRegistryRow } from "../agents/sandbox/registry-import.worker.js";
+import { writeSandboxRegistry } from "../agents/sandbox/registry-write.worker.js";
 import { writeSubagentRunValuesInDatabase } from "../agents/subagents/registry/subagent-registry.store.kernel.js";
-import * as worktreeRegistry from "../agents/worktrees/registry-read.kernel.js";
+import {
+  isWorktreeRegistryReadCommand,
+  executeWorktreeRegistryReadCommand,
+} from "../agents/worktrees/registry-read.worker.js";
+import { executeWorktreeRunLeaseCommand } from "../agents/worktrees/run-lease-store.worker.js";
 import { listAuditEventsInDatabase } from "../audit/audit-event-read.kernel.js";
 import { executeAuditWriterCommand } from "../audit/audit-event-writer.worker.js";
 import { readClawInstallSchemaVersionRows } from "../claws/provenance-runtime-read.kernel.js";
@@ -92,19 +97,11 @@ import {
 } from "../plugins/official-external-plugin-catalog-snapshot-store.kernel.js";
 import { HostedCatalogSignedFeedMonotonicityError } from "../plugins/official-external-plugin-catalog-source.js";
 import {
-  ensureProjectRegistrySchema,
-  insertProjectRegistryInDatabase,
-  listProjectRegistryInDatabase,
-  removeProjectRegistryInDatabase,
-  resolveProjectCloneRefreshOwnerInDatabase,
-  resolveProjectRegistryInDatabase,
-  resolveRecordedProjectRootInDatabase,
-} from "../projects/project-registry.kernel.js";
+  executeProjectRegistryCommand,
+  isProjectRegistryCommand,
+} from "../projects/project-registry.worker.js";
 import { purgeExpiredSecretStoreEntriesInDatabase } from "../secrets/store/secret-store-expiry.kernel.js";
-import {
-  pruneSessionStateEventsInDatabase,
-  recordSessionStateEventInDatabase,
-} from "../sessions/session-state-events.kernel.js";
+import { executeSessionStateCommand } from "../sessions/session-state-events.worker.js";
 import { listWatchedSessionUpstreamLinksInDatabase } from "../sessions/session-upstream-links.kernel.js";
 import {
   isSkillUploadCommand,
@@ -114,7 +111,10 @@ import * as skillWorkshop from "../skills/workshop/store.worker.js";
 import { isTaskRegistryWorkerCommand } from "../tasks/task-registry.worker-contract.js";
 import { executeTaskRegistryCommand } from "../tasks/task-registry.worker.js";
 import { executeTranscriptRead } from "../transcripts/store-worker-read.js";
-import { executeTranscriptWrite } from "../transcripts/store-worker-write.js";
+import {
+  executeTranscriptWrite,
+  isTranscriptWriteCommand,
+} from "../transcripts/store-worker-write.js";
 import {
   listAgentProvenanceInDatabase,
   readAgentProvenanceBatchInDatabase,
@@ -133,7 +133,6 @@ import {
   withExistingOpenClawStateDatabaseReadOnly,
 } from "./openclaw-state-db-readonly.js";
 import { runOpenClawStateWriteTransaction } from "./openclaw-state-db.js";
-import { assertOpenClawStateLeaseWorkerOwnedInTransaction } from "./openclaw-state-lease-worker.js";
 import type {
   OpenClawStateWorkerOperations,
   OpenClawStateWorkerRuntimeCommand,
@@ -411,6 +410,9 @@ export function executeSharedStateCommand(
       }) ?? { state: {}, basis: {} }
     );
   }
+  if (isNodeWorkerJournalCommand(command)) {
+    return executeNodeWorkerJournalCommand(command, context.databasePath, open);
+  }
   if (command.type === "deviceAuth.read" || command.type === "deviceAuth.readOrigin") {
     const read = (db: OpenClawStateDatabase["db"]) =>
       command.type === "deviceAuth.read"
@@ -433,10 +435,11 @@ export function executeSharedStateCommand(
   if (command.type === "deviceAuth.list") {
     return deviceAuth.readDeviceAuthTokensFromDatabase(database.db, command.input);
   }
-  if (command.type === "transcripts.append" || command.type === "transcripts.writeSummary") {
+  if (isTranscriptWriteCommand(command)) {
     return executeTranscriptWrite(command, { database, path: context.databasePath });
   }
   switch (command.type) {
+    case "transcripts.canonicalSessionRow":
     case "transcripts.readEntries":
     case "transcripts.exportOwnership":
     case "transcripts.exportPathCollisions":
@@ -477,18 +480,6 @@ export function executeSharedStateCommand(
   if (command.type === "nativeHookRelay.listSnapshots") {
     return listNativeHookRelayBridgeSnapshotsInDatabase(database);
   }
-  if (
-    command.type === "nativeHookRelay.write" ||
-    command.type === "nativeHookRelay.renew" ||
-    command.type === "nativeHookRelay.deleteOwned" ||
-    command.type === "nativeHookRelay.prune"
-  ) {
-    return executeNativeHookRelayMutation(command, {
-      database,
-      path: context.databasePath,
-      env: getSqliteWorkerStateContext().environment,
-    });
-  }
   if (command.type === "sessionUpstream.listWatched") {
     return listWatchedSessionUpstreamLinksInDatabase(database.db);
   }
@@ -503,8 +494,19 @@ export function executeSharedStateCommand(
     path: context.databasePath,
     env: getSqliteWorkerStateContext().environment,
   };
+  if (
+    command.type === "nativeHookRelay.write" ||
+    command.type === "nativeHookRelay.renew" ||
+    command.type === "nativeHookRelay.deleteOwned" ||
+    command.type === "nativeHookRelay.prune"
+  ) {
+    return executeNativeHookRelayMutation(command, writeOptions);
+  }
   if (command.type === "sandboxRegistry.insertIfMissing") {
     return importSandboxRegistryRow(command.input, writeOptions);
+  }
+  if (command.type === "sandboxRegistry.write") {
+    return writeSandboxRegistry(command.input, writeOptions);
   }
   if (command.type === "secrets.purge") {
     return purgeExpiredSecretStoreEntriesInDatabase(command.input, writeOptions);
@@ -514,9 +516,6 @@ export function executeSharedStateCommand(
     command.type === "conversationBindings.touch"
   ) {
     return executeCurrentConversationBindingCommand(command, writeOptions);
-  }
-  if (isNodeWorkerJournalCommand(command)) {
-    return executeNodeWorkerJournalCommand(command, writeOptions);
   }
   if (command.type === "sessionGroups.mutate") {
     return mutateSessionGroupCatalogInDatabase(database, command.input, writeOptions.env);
@@ -571,18 +570,8 @@ export function executeSharedStateCommand(
       { operationLabel: "config-machine-state.update" },
     );
   }
-  if (command.type === "sessionState.recordGoalChange") {
-    return runOpenClawStateWriteTransaction(
-      ({ db }) =>
-        recordSessionStateEventInDatabase(db, command.input.event, command.input.now).notices,
-      writeOptions,
-    );
-  }
-  if (command.type === "sessionState.prune") {
-    return runOpenClawStateWriteTransaction(
-      ({ db }) => pruneSessionStateEventsInDatabase(db, command.input.now),
-      writeOptions,
-    );
+  if (command.type === "sessionState.record" || command.type === "sessionState.prune") {
+    return executeSessionStateCommand(command, writeOptions);
   }
   if (command.type === "plugins.catalogSnapshot.write") {
     try {
@@ -625,66 +614,14 @@ export function executeSharedStateCommand(
       writeOptions,
     );
   }
-  if (command.type === "projects.findRoot") {
-    ensureProjectRegistrySchema(writeOptions);
-    return resolveRecordedProjectRootInDatabase(database.db, command.input.repoRoot);
+  if (isWorktreeRegistryReadCommand(command)) {
+    return executeWorktreeRegistryReadCommand(database.db, command);
   }
-  if (command.type === "projects.list") {
-    ensureProjectRegistrySchema(writeOptions);
-    return listProjectRegistryInDatabase(database.db);
+  if (command.type === "worktrees.releaseRunLease" || command.type === "worktrees.reapRunLeases") {
+    return executeWorktreeRunLeaseCommand(command, writeOptions);
   }
-  if (command.type === "worktrees.list" || command.type === "worktrees.liveIds") {
-    return command.type === "worktrees.list"
-      ? worktreeRegistry.listRegistryWorktreesInDatabase(database.db)
-      : worktreeRegistry.listLiveRegistryWorktreeIdsInDatabase(database.db);
-  }
-  if (command.type === "projects.resolve") {
-    ensureProjectRegistrySchema(writeOptions);
-    return resolveProjectRegistryInDatabase(database.db, command.input.id);
-  }
-  if (command.type === "projects.insert") {
-    ensureProjectRegistrySchema(writeOptions);
-    return runOpenClawStateWriteTransaction(
-      ({ db }) => {
-        const { project, lease } = command.input;
-        if (lease.scope !== "projects.checkout" || lease.key !== project.repoRoot) {
-          throw new Error("Project registry mutation requires its checkout lifecycle lease");
-        }
-        assertOpenClawStateLeaseWorkerOwnedInTransaction(db, lease);
-        return insertProjectRegistryInDatabase(db, project);
-      },
-      writeOptions,
-      { operationLabel: "projects.registry.insert" },
-    );
-  }
-  if (command.type === "projects.resolveRefreshOwner") {
-    ensureProjectRegistrySchema(writeOptions);
-    return runOpenClawStateWriteTransaction(
-      ({ db }) => {
-        const { project, lease } = command.input;
-        if (lease.scope !== "projects.checkout" || lease.key !== project.repoRoot) {
-          throw new Error("Project refresh requires its checkout lifecycle lease");
-        }
-        assertOpenClawStateLeaseWorkerOwnedInTransaction(db, lease);
-        return resolveProjectCloneRefreshOwnerInDatabase(db, project);
-      },
-      writeOptions,
-      { operationLabel: "projects.registry.refresh-owner.resolve" },
-    );
-  }
-  if (command.type === "projects.remove") {
-    return runOpenClawStateWriteTransaction(
-      ({ db }) => {
-        const { project, lease } = command.input;
-        if (lease.scope !== "projects.checkout" || lease.key !== project.repoRoot) {
-          throw new Error("Project registry mutation requires its checkout lifecycle lease");
-        }
-        assertOpenClawStateLeaseWorkerOwnedInTransaction(db, lease);
-        return removeProjectRegistryInDatabase(db, project);
-      },
-      writeOptions,
-      { operationLabel: "projects.registry.remove" },
-    );
+  if (isProjectRegistryCommand(command)) {
+    return executeProjectRegistryCommand(command, writeOptions);
   }
   if (command.type === "config.health.patch") {
     const { configPath, patch, expected, updatedAtMs } = command.input;

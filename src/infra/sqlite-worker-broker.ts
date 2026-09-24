@@ -49,6 +49,7 @@ import { SqliteWorkerInputAdmission } from "./sqlite-worker-input-admission.js";
 import type { SqliteWorkerAdmissionFactory } from "./sqlite-worker-operation-admission.js";
 import type { SqliteWorkerOperationSettlement } from "./sqlite-worker-operation-settlement.js";
 import type { SqliteWorkerStateContext } from "./sqlite-worker-state-context.js";
+import { sqliteWorkerRequestBytes } from "./sqlite-worker-state-context.js";
 
 const ADMISSION_TIMEOUT_MS = 10_000;
 const MAX_STORES = 64;
@@ -124,8 +125,9 @@ export class SqliteWorkerBroker {
       return Promise.reject(toErrorObject(error, "SQLite worker input could not be serialized"));
     }
     return this.inputAdmission
-      .open(snapshot.input.byteLength + (snapshot.preparation?.byteLength ?? 0), () =>
-        this.openAdmitted<Operations>(snapshot, client),
+      .open(
+        sqliteWorkerRequestBytes(snapshot.input, snapshot.stateContext, snapshot.preparation),
+        () => this.openAdmitted<Operations>(snapshot, client),
       )
       .catch((error: unknown) => {
         this.clients.delete(client);
@@ -227,7 +229,7 @@ export class SqliteWorkerBroker {
             ? { sourceLoaderUrl: import.meta.resolve("tsx/esm/api") }
             : {}),
         },
-        input.byteLength + (options.preparation?.byteLength ?? 0),
+        sqliteWorkerRequestBytes(input, options.stateContext, options.preparation),
         {
           dispatchState: opening.openDispatch,
           assertCurrent: options.assertCurrent,
@@ -252,7 +254,7 @@ export class SqliteWorkerBroker {
       retainSqliteWorkerAdmissionCleanup(admittedActor, options.retainCleanup, () =>
         this.lifecycle.closeActor(admittedActor, options.maintenanceScope),
       );
-      options.onNativeStopped?.(actor.nativeStopped);
+      options.onNativeStopped?.(actor.nativeStopped, () => admittedActor.closeReceipt);
       await actor.opened;
       options.assertCurrent?.();
       if (actor.retirementRequested) {
@@ -313,7 +315,7 @@ export class SqliteWorkerBroker {
             input: payload,
             ...(scope?.stateContext ? { stateContext: scope.stateContext } : {}),
           },
-          payload.byteLength,
+          sqliteWorkerRequestBytes(payload, scope?.stateContext),
           {
             signal,
             scope,
@@ -436,7 +438,15 @@ export class SqliteWorkerBroker {
     return this.lifecycle.createSlot(options, borrowedGenerationSlot, (slot) => ({
       fail: (reason, currentError, completed, openOutcome) =>
         this.fail(slot, reason, currentError, completed, openOutcome),
-      finish: (job, error, value, settlement) => this.finish(job, error, value, settlement),
+      finish: (job, error, value, settlement, closeReceipt) => {
+        if (job.request.type === "close" && closeReceipt) {
+          const actor = [...slot.actors].find((candidate) => candidate.id === job.request.actor);
+          if (actor) {
+            actor.closeReceipt = closeReceipt;
+          }
+        }
+        this.finish(job, error, value, settlement);
+      },
       dispatch: () => this.dispatch(slot),
     }));
   }
@@ -641,9 +651,6 @@ export class SqliteWorkerBroker {
       if (waitingSlot === slot) {
         resume(slot.failed);
       }
-    }
-    if (completed) {
-      slot.retiredAfterCompletion = true;
     }
     const current = slot.current;
     slot.current = undefined;
