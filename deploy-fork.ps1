@@ -1,16 +1,16 @@
-# deploy-fork.ps1 — Deploy our fork build of OpenClaw to the global npm install.
+﻿# deploy-fork.ps1 - Deploy our fork build of OpenClaw to the global npm install.
 #
 # Doctrine (2026-09-23): "The best agent harness is the one that we fork and make our own."
 #   - Source of truth: D:\projects\openclaw  (fork of github.com/openclaw/openclaw)
 #   - Installs come ONLY from our built artifact (docker-e2e-package tarball).
-#   - NEVER run `openclaw update` / `npm update -g openclaw` / `npm i -g openclaw` — those
+#   - NEVER run `openclaw update` / `npm update -g openclaw` / `npm i -g openclaw` - those
 #     replace our build with stock npm. update.channel=extended-stable + checkOnStart=false
 #     + OPENCLAW_NO_AUTO_UPDATE=1 block automatic/background swaps; this script is the
 #     sanctioned deploy path.
 #
 # OWNER-RUN ONLY. This stops and restarts the "OpenClaw Gateway" scheduled task (kills
 # agent sessions; Discord unclean-handoff cooldown doctrine applies). Do NOT invoke from
-# an agent session — run it from a host shell.
+# an agent session - run it from a host shell.
 
 param(
   [string]$Tarball = "",
@@ -40,12 +40,12 @@ Step "Tarball: $Tarball"
 
 # --- 2. Preflight: prove the tarball is OUR fork build, not stock npm ------------
 $members = tar -tf $Tarball | Where-Object { $_ -match '^package/dist/prepared-model-runtime-[^/]+\.mjs$' }
-if (-not $members) { throw "PREFLIGHT FAILED: no prepared-model-runtime dist files in tarball — is this an openclaw package?" }
+if (-not $members) { throw "PREFLIGHT FAILED: no prepared-model-runtime dist files in tarball - is this an openclaw package?" }
 $hits = 0
 foreach ($m in $members) {
   $hits += (tar -xOf $Tarball $m 2>$null | Select-String -SimpleMatch $DistMarker -ErrorAction SilentlyContinue | Measure-Object).Count
 }
-if ($hits -lt 1) { throw "PREFLIGHT FAILED: tarball lacks fork dist marker '$DistMarker' — refusing to deploy (that would install stock)." }
+if ($hits -lt 1) { throw "PREFLIGHT FAILED: tarball lacks fork dist marker '$DistMarker' - refusing to deploy (that would install stock)." }
 Step "Preflight OK: fork dist marker present ($hits hits)"
 
 # --- 3. Confirm --------------------------------------------------------------------
@@ -54,7 +54,7 @@ if (-not $SkipConfirm) {
   Write-Host "Current install: $Installed"
   if ($CooldownSeconds -gt 0) { Write-Host "Cooldown between stop and start: $CooldownSeconds s (Discord handoff doctrine: 5-10 min recommended)." }
   $ans = Read-Host "Proceed? (y/N)"
-  if ($ans -notmatch '^y') { Write-Host "Aborted — nothing changed."; exit 1 }
+  if ($ans -notmatch '^y') { Write-Host "Aborted - nothing changed."; exit 1 }
 }
 
 # --- 4. Stop gateway -----------------------------------------------------------------
