@@ -57,10 +57,32 @@ if (-not $SkipConfirm) {
   if ($ans -notmatch '^y') { Write-Host "Aborted - nothing changed."; exit 1 }
 }
 
-# --- 4. Stop gateway -----------------------------------------------------------------
+# --- 4. Stop gateway (task + reap orphans) --------------------------------------------
 Step "Stopping scheduled task: $TaskName"
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 5
+
+# The task 'stop' does NOT reliably kill the gateway process tree on this box
+# (task reads stopped while the gateway still serves the port). Reap orphans
+# explicitly: kill node processes running from the installed tree, then wait
+# for the port to free. (gateway-restart-verify doctrine; verified 2026-09-24)
+$deadline = (Get-Date).AddSeconds(45)
+do {
+  $listeners = Get-NetTCPConnection -LocalPort 18789 -State Listen -ErrorAction SilentlyContinue
+  $tree = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*$Installed*" }
+  if ($listeners) {
+    $listeners | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+  }
+  if ($tree) {
+    $tree | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Write-Host "  reaped $($tree.Count) orphaned gateway process(es)"
+  }
+  if (-not $listeners -and -not $tree) { break }
+  Start-Sleep -Milliseconds 800
+} while ((Get-Date) -lt $deadline)
+$still = Get-NetTCPConnection -LocalPort 18789 -State Listen -ErrorAction SilentlyContinue
+if ($still) { throw "Gateway still listening on 18789 after reaping (PID $($still.OwningProcess)) - aborting, nothing changed." }
+Step "Gateway stopped (port 18789 free)"
 if ($CooldownSeconds -gt 0) {
   Write-Host "Cooldown $CooldownSeconds s (Discord sockets settle)..."
   Start-Sleep -Seconds $CooldownSeconds
@@ -75,6 +97,13 @@ if (Test-Path $Installed) {
 }
 
 # --- 6. Install fork tarball ------------------------------------------------------------
+# Stale bin shims (openclaw / openclaw.cmd / openclaw.ps1) in $NpmRoot block npm's
+# reify with EEXIST when a prior install aborted (observed 2026-09-24). Remove them
+# here; npm recreates the shims on install.
+foreach ($shim in @('openclaw', 'openclaw.cmd', 'openclaw.ps1')) {
+  $sp = Join-Path $NpmRoot $shim
+  if (Test-Path $sp) { Remove-Item $sp -Force; Write-Host "  removed stale bin shim: $sp" }
+}
 Step "npm install -g $Tarball"
 npm install -g $Tarball
 if ($LASTEXITCODE -ne 0) {
